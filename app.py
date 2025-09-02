@@ -33,17 +33,19 @@ MAXIMO_API_KEY = os.environ.get("MAXIMO_API_KEY")
 
 # Check for missing keys and print a warning.
 if not GOOGLE_API_KEY:
-    # For development, you can provide a fallback key here if the environment variable is not set.
+    # For development, provide a hardcoded fallback key if the environment variable is not set.
     print("WARNING: GOOGLE_API_KEY environment variable not found. Using hardcoded key for development.")
     GOOGLE_API_KEY = "AIzaSyBCIP9nSgxdJmMaBwITcbuFZ81dC9bzJLQ"
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY environment variable is not set.")
 if not MAXIMO_HOST:
     print("WARNING: MAXIMO_HOST environment variable not found. Using hardcoded development host.")
-    MAXIMO_HOST = "http://10.0.0.1" # Default from previous sessions
+    # This should match the IP address you found for your Maximo server (e.g., "http://10.0.0.1" or "https://10.0.0.1")
+    MAXIMO_HOST = "http://10.0.0.1" 
 if not MAXIMO_API_KEY:
     print("WARNING: MAXIMO_API_KEY environment variable not found. Using hardcoded development key.")
-    MAXIMO_API_KEY = "pk4r5qvq" # Default from previous sessions
+    # This should be your Maximo API key
+    MAXIMO_API_KEY = "pk4r5qvq" 
 
 API_KEYS = {"google": GOOGLE_API_KEY, "openai": OPENAI_API_KEY}
 
@@ -233,12 +235,13 @@ def update_kb():
 
 def get_maximo_client():
     """Helper function to instantiate and return a Maximo client or raise an error."""
-    # The configuration is now handled globally at the top of the file.
-    if not MAXIMO_HOST or not MAXIMO_API_KEY:
+    host = os.environ.get("MAXIMO_HOST")
+    api_key = os.environ.get("MAXIMO_API_KEY")
+    if not host or not api_key:
         # For a web app, it's better to raise an exception that can be caught
         # and shown to the user, rather than just printing to the console.
         raise ValueError("Server configuration error: MAXIMO_HOST and MAXIMO_API_KEY must be set.")
-    return MaximoAPIClient(host=MAXIMO_HOST, api_key=MAXIMO_API_KEY)
+    return MaximoAPIClient(host=host, api_key=api_key)
 
 @app.route('/maximo_chat_agent')
 def maximo_chat_agent():
