@@ -1,583 +1,294 @@
 import os
-import sys
-import argparse
-import google.generativeai as genai
 import json
-import numpy as np
-from openai import OpenAI
+import io
+import zipfile
+from flask import Flask, render_template, request, jsonify, send_file, flash, session, redirect, url_for
+import requests # For handling exceptions from the requests library
+from maximo_api_agent import MaximoAPIClient
+from werkzeug.utils import secure_filename
+
+import maximo_natural_language_agent as maximo_nl_agent
+# Import the functions from your existing script
+import maximo_test_case_generator as generator
+
+# --- Configuration ---
+project_dir = r'C:\Users\2166337\Test_Case'
+learning_dir = os.path.join(project_dir, 'Learning_Maximo')
+index_dir = os.path.join(project_dir, 'Maximo_VectorIndex')
+sample_test_dir = os.path.join(project_dir, 'sample_test')
+output_dir = os.path.join(project_dir, 'output') # For final generated files
+
+os.makedirs(learning_dir, exist_ok=True)
+os.makedirs(index_dir, exist_ok=True)
+os.makedirs(sample_test_dir, exist_ok=True)
+os.makedirs(output_dir, exist_ok=True)
+ 
+# --- API Keys & Configuration ---
+# CRITICAL: For deployment, load keys from environment variables, not from code.
+# This centralizes all key management.
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+MAXIMO_HOST = os.environ.get("MAXIMO_HOST")
+MAXIMO_API_KEY = os.environ.get("MAXIMO_API_KEY")
+
+# Check for missing keys and print a warning.
+if not GOOGLE_API_KEY:
+    # For development, you can provide a fallback key here if the environment variable is not set.
+    print("WARNING: GOOGLE_API_KEY environment variable not found. Using hardcoded key for development.")
+    GOOGLE_API_KEY = "AIzaSyBCIP9nSgxdJmMaBwITcbuFZ81dC9bzJLQ"
+if not OPENAI_API_KEY:
+    print("WARNING: OPENAI_API_KEY environment variable is not set.")
+if not MAXIMO_HOST:
+    print("WARNING: MAXIMO_HOST environment variable not found. Using hardcoded development host.")
+    MAXIMO_HOST = "http://10.0.0.1" # Default from previous sessions
+if not MAXIMO_API_KEY:
+    print("WARNING: MAXIMO_API_KEY environment variable not found. Using hardcoded development key.")
+    MAXIMO_API_KEY = "pk4r5qvq" # Default from previous sessions
+
+API_KEYS = {"google": GOOGLE_API_KEY, "openai": OPENAI_API_KEY}
 
 
-def get_system_prompt() -> str:
+# By default, Flask automatically looks for templates in a folder named 'templates'.
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.urandom(24) # Secret key is required for sessions
+
+
+@app.route('/')
+def index():
+    """Renders the main home/landing page."""
+    return render_template('home.html')
+
+@app.route('/kb') # Corrected route from previous step
+def knowledge_base():
+    """Renders the knowledge base management page."""
+    return render_template('kb_management.html')
+
+@app.route('/agent')
+def agent():
+    """Renders the main test case agent page, loading from session if available."""
+    current_test_case = session.get('current_test_case', None)
+    return render_template('index.html', current_test_case=current_test_case)
+
+@app.route('/new_agent_session')
+def new_agent_session():
+    """Clears the current test case from the session and redirects to the agent page."""
+    session.pop('current_test_case', None)
+    flash("Previous session cleared. You can start a new test case.", "message")
+    return redirect(url_for('agent'))
+
+@app.route('/process_chat_message', methods=['POST'])
+def process_chat_message():
     """
-    Returns the static system prompt that defines the AI's persona and primary objective.
-    """
-    return """
-You are an expert IBM Maximo and Senior QA Engineer with 30 years of experience creating formal test case documentation for enterprise software applications at leading companies like IBM and Google.
-Your primary objective is to create comprehensive, well-structured test cases that clearly outline verification steps for specific functionality, ensuring the application behaves as expected under various conditions.
-Your task is to convert a user-provided scenario into a detailed, formal test case formatted in Markdown.
-"""
-
-def build_user_prompt(scenario: str, custom_context: str, example_section: str) -> str:
-    """
-    Constructs the user-facing part of the prompt, including context, instructions, and the specific scenario.
-    """
-    context_section = ""
-    if custom_context:
-        context_section = f"""
-**Additional Custom Context Provided by User:**
-The following information is from a user-provided document. Use it as a primary reference to understand specific processes, naming conventions, or data mentioned in the scenario.
----
-{custom_context}
----
-"""
-    return f"""
-First, review any additional custom context provided below, then proceed with the instructions.
-{context_section}
-
-**Instructions:**
-1.  Analyze the user's scenario.
-2.  Generate a comprehensive test case with the following sections:
-    - **Test Case ID:** A unique identifier (e.g., TC-MAX-001).
-    - **Title:** A concise and descriptive title based on the scenario.
-    - **Objective:** A brief summary of what this test case aims to verify.
-    - **Prerequisites:** A list of all necessary preconditions, such as:
-        - User Roles/Permissions (e.g., Maintenance Supervisor, Storeroom Clerk).
-        - Required Data (e.g., An approved Work Order with status 'APPR', a specific item in the storeroom).
-        - System State (e.g., User is logged into Maximo).
-    - **Test Steps:** A table with three columns: 'Actions', 'Expected Result', and 'Actual Result'. IMPORTANT: Do not use bold markdown (`**`) for UI elements like field names or buttons within the table cells.
-    - **Test Data:** A section listing any specific data used in the test, like Work Order numbers, Asset numbers, or User IDs.
-{example_section}
-
----
-**User's Scenario to process:**
-"{scenario}"
-"""
-
-def generate_maximo_test_case(scenario: str, api_keys: dict, custom_context: str, example_section: str, model_name: str) -> str:
-    """
-    Uses the Gemini API to generate a Maximo test case from a scenario.
-
-    Args:
-        scenario: The user-provided scenario string.
-        api_keys: A dictionary containing API keys for different services.
-        custom_context: Optional string containing user-specific documentation.
-        example_section: The formatted example to be included in the prompt.
-        model_name: The name of the AI model to use.
-
-    Returns:
-        The generated test case in Markdown format.
+    Receives a user message, classifies its intent, and routes to the
+    appropriate generation or modification logic.
     """
     try:
-        print(f"--> Generating test case with model: '{model_name}'")
+        # Get data from the form
+        scenario_or_instruction = request.form.get('scenario')
+        model_name = request.form.get('model_name', 'gemini-1.5-flash-latest')
 
-        if "gemini" in model_name:
-            # For Gemini, we combine the system and user prompts into a single prompt.
-            full_prompt = get_system_prompt() + "\n\n" + build_user_prompt(scenario, custom_context, example_section)
-            genai.configure(api_key=api_keys.get('google'))
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(full_prompt)
-            return response.text.strip().strip('```markdown').strip('```').strip()
-        
-        elif "gpt" in model_name:
-            try:
-                import openai
-            except ImportError:
-                raise ImportError("The 'openai' library is required to use GPT models. Please install it using: pip install openai")
+        if not scenario_or_instruction:
+            return jsonify({'error': 'Input cannot be empty.'}), 400
+
+        # Step 1: Classify the user's intent
+        intent = generator.classify_user_intent(scenario_or_instruction, API_KEYS)
+        print(f"--> Classified intent as: {intent}")
+
+        if intent == "GENERATE":
+            # This is a new scenario, so clear any previous session data.
+            session.pop('current_test_case', None)
             
-            # For OpenAI, it's best practice to use a separate "system" message for the persona.
-            system_prompt = get_system_prompt()
-            user_prompt = build_user_prompt(scenario, custom_context, example_section)
+            template_stream = None
+            if 'template_file' in request.files and request.files['template_file'].filename != '':
+                template_stream = request.files['template_file']
 
-            client = openai.OpenAI(api_key=api_keys.get('openai'))
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ]
+            example_section = generator._create_example_section(template_stream=template_stream)
+            custom_context = generator.retrieve_relevant_context(scenario_or_instruction, index_dir, API_KEYS['google'])
+
+            markdown_result = generator.generate_maximo_test_case(
+                scenario_or_instruction, API_KEYS, custom_context, example_section, model_name
             )
-            return response.choices[0].message.content.strip().strip('```markdown').strip('```').strip()
-        
-        else:
-            raise ValueError(f"Unsupported or unknown model name: {model_name}")
 
-    except Exception as e:
-        print(f"An error occurred while communicating with the AI model '{model_name}': {e}", file=sys.stderr)
-        raise # Re-raise the exception to be caught by the Flask app
-
-def save_steps_to_excel(markdown_text: str, excel_filename: str):
-    """
-    Parses a Markdown string to find a test steps table and saves it to an Excel file.
-    """
-    try:
-        import pandas as pd
-    except ImportError:
-        print("\nWarning: `pandas` and `openpyxl` are required to save to Excel.", file=sys.stderr)
-        print("Please install them using: pip install pandas openpyxl", file=sys.stderr)
-        return
-
-    lines = markdown_text.split('\n')
-    table_data = []
-    
-    # Simple state machine to parse the table
-    # State 0: Looking for header
-    # State 1: Found header, looking for separator
-    # State 2: Found separator, reading data rows
-    state = 0
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            if state == 2: # Empty line after table data means table ended
-                break
-            continue
-
-        if state == 0 and "Actions" in line and "Expected Result" in line and "Actual Result" in line and line.startswith('|'):
-            state = 1
-        elif state == 1 and line.startswith('|--'):
-            state = 2
-        elif state == 2 and line.startswith('|'):
-            parts = [part.strip() for part in line.split('|')]
-            if len(parts) >= 4:
-                table_data.append({'Actions': parts[1], 'Expected Result': parts[2], 'Actual Result': parts[3]})
-        elif state == 2:
-            # We were reading data, but this line doesn't fit the pattern. Table must be over.
-            break
-
-    if not table_data:
-        print("\nWarning: Could not find or parse test steps table in the generated Markdown. Excel file not created.")
-        return
-
-    try:
-        df = pd.DataFrame(table_data)
-        df.to_excel(excel_filename, index=False, engine='openpyxl')
-        print(f"Successfully extracted test steps and saved to '{os.path.abspath(excel_filename)}'")
-    except Exception as e:
-        print(f"\nError saving test steps to Excel file '{excel_filename}': {e}", file=sys.stderr)
-
-def modify_test_steps(steps_table_md: str, modification_instruction: str, api_keys: dict, model_name: str) -> str:
-    """
-    Takes a markdown table of test steps and a modification instruction,
-    and returns the updated markdown table using the Gemini API.
-    """
-    prompt = f"""
-You are an expert test case editor. Your task is to modify the provided Markdown table of test steps based on the user's instruction.
-
-**Rules:**
-1.  Return ONLY the complete, updated Markdown table.
-2.  Do not include any explanations, notes, or text outside of the table.
-3.  Ensure the output is valid Markdown. Do not use HTML tags like `<br>`.
-4.  If a step is removed, renumber the subsequent steps sequentially starting from 1.
-5.  The table must have three columns: "Actions", "Expected Result", "Actual Result".
-
-**Original Test Steps Table:**
-{steps_table_md}
-
-**User's Instruction:**
-"{modification_instruction}"
-
-**Updated Markdown Table:**
-"""
-    try:
-        print(f"--> Modifying test steps with model: '{model_name}'")
-        if "gemini" in model_name:
-            genai.configure(api_key=api_keys.get('google'))
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            return response.text.strip().strip('```markdown').strip('```').strip()
-
-        elif "gpt" in model_name:
-            try:
-                import openai
-            except ImportError: 
-                raise ImportError("The 'openai' library is required to use GPT models. Please install it using: pip install openai")
+            parsed_data = generator.parse_markdown_to_dict(markdown_result)
+            parsed_data['scenario'] = scenario_or_instruction # Store original scenario
             
-            client = openai.OpenAI(api_key=api_keys.get('openai'))
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return response.choices[0].message.content.strip().strip('```markdown').strip('```').strip()
-        else:
-            raise ValueError(f"Unsupported or unknown model name: {model_name}")
-    except Exception as e:
-        print(f"An error occurred during test step modification: {e}", file=sys.stderr)
-        raise
+            session['current_test_case'] = parsed_data
+            return jsonify(parsed_data)
 
-def classify_user_intent(user_input: str, api_keys: dict) -> str:
-    """
-    Uses a Gemini model to classify the user's intent as either 'GENERATE' or 'MODIFY'.
-    """
-    # We use a very fast model for this classification task.
-    model_name = 'gemini-1.5-flash-latest'
-    
-    prompt = f"""
-Analyze the user's request below. Is the user asking to generate a completely new test case from a scenario, or are they asking to modify an existing one?
-Respond with only a single word: either "GENERATE" or "MODIFY".
+        elif intent == "MODIFY":
+            current_test_case = session.get('current_test_case')
+            if not current_test_case or 'test_steps' not in current_test_case:
+                return jsonify({'error': 'There is no active test case to modify. Please generate one first.'}), 400
 
-Examples:
-- Request: "create a test case for asset creation" -> GENERATE
-- Request: "a user creates a work order and approves it" -> GENERATE
-- Request: "add a new step to check the log file" -> MODIFY
-- Request: "remove step 3" -> MODIFY
-- Request: "change the objective to verify the email" -> MODIFY
-- Request: "make step 2 more detailed" -> MODIFY
-
-User's Request: "{user_input}"
-"""
-    try:
-        print(f"--> Classifying intent for input: '{user_input}'")
-        genai.configure(api_key=api_keys.get('google'))
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(prompt)
-        # Clean up the response to get a single word.
-        intent = response.text.strip().upper()
-        if intent not in ["GENERATE", "MODIFY"]:
-            # Fallback heuristic if the model gives an unexpected response
-            return "GENERATE"
-        return intent
-    except Exception as e:
-        print(f"An error occurred during intent classification: {e}", file=sys.stderr)
-        return "GENERATE" # Default to GENERATE on error
-
-def parse_markdown_to_dict(markdown_text: str) -> dict:
-    """
-    Parses the full markdown test case into a dictionary for easier handling in a web UI.
-    """
-    test_case_dict = {}
-    lines = markdown_text.split('\n')
-    
-    # This is a simplified parser. A more robust solution might use regex.
-    for line in lines:
-        if line.startswith('- **Test Case ID:**'): test_case_dict['test_case_id'] = line.split(':', 1)[1].strip()
-        elif line.startswith('- **Title:**'): test_case_dict['title'] = line.split(':', 1)[1].strip()
-        elif line.startswith('- **Objective:**'): test_case_dict['objective'] = line.split(':', 1)[1].strip()
-        elif line.startswith('- **Scenario:**'): test_case_dict['scenario'] = line.split(':', 1)[1].strip()
-        elif line.startswith('- **Prerequisites:**'): test_case_dict['prerequisites'] = line.split(':', 1)[1].strip()
-
-    test_case_dict['test_steps'] = []
-    in_table = False
-    for line in lines:
-        line = line.strip()
-        if not line:
-            if in_table: break
-            continue
-        if "Actions" in line and "Expected Result" in line and line.startswith('|'):
-            in_table = True
-            continue
-        if in_table and line.startswith('|--'):
-            continue
-        if in_table and line.startswith('|'):
-            parts = [part.strip() for part in line.split('|')]
-            if len(parts) >= 4:
-                test_case_dict['test_steps'].append({'Actions': parts[1], 'Expected Result': parts[2], 'Actual Result': parts[3]})
-    return test_case_dict
-
-def _read_pdf_content(filepath: str) -> str:
-    """Reads text content from a PDF file."""
-    try:
-        import pypdf
-    except ImportError:
-        print("\nWarning: `pypdf` is required to read PDF files.", file=sys.stderr)
-        print("Please install it using: pip install pypdf", file=sys.stderr)
-        return ""
-    
-    text = []
-    try:
-        with open(filepath, 'rb') as f:
-            reader = pypdf.PdfReader(f)
-            for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text.append(page_text)
-        return "\n".join(text)
-    except Exception as e:
-        print(f"Warning: Could not read PDF file '{os.path.basename(filepath)}': {e}", file=sys.stderr)
-        return ""
-
-def _read_docx_content(filepath: str) -> str:
-    """Reads text content from a DOCX file."""
-    try:
-        import docx
-    except ImportError:
-        print("\nWarning: `python-docx` is required to read DOCX files.", file=sys.stderr)
-        print("Please install it using: pip install python-docx", file=sys.stderr)
-        return ""
-    
-    text = []
-    try:
-        document = docx.Document(filepath)
-        for para in document.paragraphs:
-            text.append(para.text)
-        return "\n".join(text)
-    except Exception as e:
-        print(f"Warning: Could not read DOCX file '{os.path.basename(filepath)}': {e}", file=sys.stderr)
-        return ""
-
-def _read_txt_content(filepath: str) -> str:
-    """Reads text content from a TXT file."""
-    try:
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            return f.read()
-    except Exception as e:
-        print(f"Warning: Could not read TXT file '{os.path.basename(filepath)}': {e}", file=sys.stderr)
-        return ""
-
-def _chunk_text(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> list[str]:
-    """Splits text into smaller, overlapping chunks."""
-    if not text:
-        return []
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), chunk_size - chunk_overlap):
-        chunks.append(" ".join(words[i:i + chunk_size]))
-    return chunks
-
-def update_vector_index(source_dir: str, index_dir: str, api_key: str):
-    """
-    Implements the 'Update' step of RAG. It reads documents, chunks them,
-    creates vector embeddings, and saves them to an index for fast retrieval.
-    """
-    print(f"Reading documents from: {source_dir}")
-    all_chunks = []
-    for filename in sorted(os.listdir(source_dir)):
-        filepath = os.path.join(source_dir, filename)
-        if not os.path.isfile(filepath):
-            continue
-
-        content = ""
-        if filename.lower().endswith('.pdf'):
-            content = _read_pdf_content(filepath)
-        elif filename.lower().endswith('.docx'):
-            content = _read_docx_content(filepath)
-        elif filename.lower().endswith('.txt'):
-            content = _read_txt_content(filepath)
-
-        if content:
-            print(f"  - Chunking and processing '{filename}'...")
-            chunks = _chunk_text(content)
-            # Store where each chunk came from for context
-            for chunk in chunks:
-                all_chunks.append({"source": filename, "text": chunk})
-
-    if not all_chunks:
-        print("Warning: No text could be extracted from documents. Index not updated.")
-        return
-
-    print(f"Generated {len(all_chunks)} text chunks. Now creating embeddings...")
-    
-    # Create embeddings for all chunks
-    try:
-        genai.configure(api_key=api_key)
-        chunk_texts = [chunk['text'] for chunk in all_chunks]
-        # The 'models/embedding-001' is a powerful model for this task.
-        result = genai.embed_content(model='models/embedding-001',
-                                     content=chunk_texts,
-                                     task_type="RETRIEVAL_DOCUMENT")
-        embeddings = np.array(result['embedding'])
-        print(f"Successfully created {embeddings.shape[0]} vector embeddings.")
-
-        # Save the chunks and their embeddings
-        with open(os.path.join(index_dir, 'chunks.json'), 'w', encoding='utf-8') as f:
-            json.dump(all_chunks, f)
-        np.save(os.path.join(index_dir, 'embeddings.npy'), embeddings)
-        print(f"Vector index saved successfully to '{index_dir}'")
-
-    except Exception as e:
-        print(f"Error creating embeddings or saving index: {e}", file=sys.stderr)
-
-def retrieve_relevant_context(scenario: str, index_dir: str, api_key: str, top_k: int = 3) -> str:
-    """
-    Implements the 'Retrieve' step of RAG. It takes a user scenario, finds the
-    most relevant text chunks from the vector index, and returns them.
-    """
-    chunks_path = os.path.join(index_dir, 'chunks.json')
-    embeddings_path = os.path.join(index_dir, 'embeddings.npy')
-
-    if not (os.path.exists(chunks_path) and os.path.exists(embeddings_path)):
-        print("Warning: Vector index not found. Run with --update-index first. Continuing without context.")
-        return ""
-
-    print("Retrieving relevant context from vector index...")
-    try:
-        # Load the pre-computed index
-        with open(chunks_path, 'r', encoding='utf-8') as f:
-            all_chunks = json.load(f)
-        doc_embeddings = np.load(embeddings_path)
-
-        # Create an embedding for the user's scenario (the query)
-        genai.configure(api_key=api_key)
-        query_embedding = genai.embed_content(model='models/embedding-001',
-                                              content=scenario,
-                                              task_type="RETRIEVAL_QUERY")['embedding']
-
-        # Find the most similar documents using cosine similarity
-        query_embedding = np.array(query_embedding)
-        similarities = np.dot(doc_embeddings, query_embedding) / (np.linalg.norm(doc_embeddings, axis=1) * np.linalg.norm(query_embedding))
-
-        # Get the indices of the top_k most similar chunks
-        top_indices = np.argsort(similarities)[-top_k:][::-1]
-
-        # --- Add a relevance threshold to filter out irrelevant results ---
-        # This prevents documents that are only vaguely related from "polluting" the context.
-        relevance_threshold = 0.65 # Tuned to be slightly more permissive.
-        relevant_chunks = []
-        for i in top_indices:
-            if similarities[i] >= relevance_threshold:
-                print(f"  - Found relevant chunk from '{all_chunks[i]['source']}' (Similarity: {similarities[i]:.2f})")
-                relevant_chunks.append(f"--- Context from {all_chunks[i]['source']} ---\n{all_chunks[i]['text']}")
-            else:
-                # Since the list is sorted by similarity, a score below the threshold means the rest are also irrelevant.
-                print(f"  - Discarding chunk from '{all_chunks[i]['source']}' (Similarity: {similarities[i]:.2f} < {relevance_threshold})")
-
-        if not relevant_chunks:
-            print("  - No documents met the relevance threshold. Proceeding without custom context.")
-            return ""
-
-        return "\n\n".join(relevant_chunks)
-
-    except Exception as e:
-        print(f"Error retrieving context from vector index: {e}", file=sys.stderr)
-        return ""
-
-def _create_example_section(template_path: str | None = None, template_stream=None) -> str:
-    """Creates the full example section for the prompt, either from a template file or a hardcoded default."""
-    
-    # Prioritize the stream if it exists (from web UI), otherwise use the path (from CLI).
-    template_source = template_stream
-    if not template_source and template_path and os.path.exists(template_path):
-        template_source = template_path
-
-    if template_source:
-        print(f"Attempting to use template file...")
-        try:
+            current_steps = current_test_case['test_steps']
+            
             import pandas as pd
-            # Assuming the template's test steps are on the first sheet
-            df = pd.read_excel(template_source, engine='openpyxl')
-            template_md = df.to_markdown(index=False)
-            # Return a prompt section that specifically guides the AI to use the template for the steps
-            return f"""
-**Template Guidance:**
-When creating the 'Test Steps' table, you MUST follow the exact column structure, format, and wording style demonstrated in this example from the user-provided template:
----
-{template_md}
----
-"""
-        except Exception as e:
-            print(f"Warning: Could not process template file: {e}. Using default example.", file=sys.stderr)
-            # Fall through to default if template processing fails
+            df = pd.DataFrame(current_steps)
+            steps_table_md = df.to_markdown(index=False)
 
-    # Default hardcoded example if no template is provided or if it fails to load
-    return """
-**Guidance for Test Step Columns:**
-- **Actions:** Step-by-step user actions to be performed in the system (e.g., navigation, form entry, clicks). Clearly list the steps in sequence. Use correct Maximo navigation terms (e.g., Go To Applications → Work Order Tracking).
-- **Expected Result:** The system behavior or output that should occur if the action is executed correctly. Be precise (e.g., "Status changes to APPR", "Field becomes read-only").
-- **Actual Result:** What would be observed during a successful test execution. This should confirm the expected result was met, written in the past tense.
+            updated_table_md = generator.modify_test_steps(steps_table_md, scenario_or_instruction, API_KEYS, model_name)
 
-**Example Output Format:**
+            lines = updated_table_md.strip().split('\n')
+            header = [h.strip() for h in lines[0].strip('|').split('|')]
+            updated_steps = []
+            for line in lines[2:]:
+                parts = [p.strip() for p in line.strip('|').split('|')]
+                if len(parts) == len(header):
+                    updated_steps.append(dict(zip(header, parts)))
+            
+            session['current_test_case']['test_steps'] = updated_steps
+            session.modified = True
+            
+            return jsonify(session['current_test_case'])
 
-# Test Case: Verify Purchase Requisition Creation Restriction
-- **Test Case ID:** TC-MAX-001
-- **Title:** Verify Purchase Requisition Creation Restriction
-- **Objective:** To verify that the system prevents the creation of a Purchase Requisition when the HCC question is set to 'Yes', directing the user to SAP.
-- **Prerequisites:** User is logged into Maximo with `BUYER` role and permissions for Purchase Requisitions.
-- **Test Steps:**
-    | Actions                                                                    | Expected Result                                                              | Actual Result                                                                 |
-    |----------------------------------------------------------------------------|------------------------------------------------------------------------------|-------------------------------------------------------------------------------|
-    | 1. Navigate to Applications → Purchasing → Purchase Requisitions.          | Purchase Requisitions application opens successfully.                        | Purchase Requisitions application opened successfully.                        |
-    | 2. Change HCC question from 'No' to 'Yes'.                                 | Error message appears: 'Purchase Requisition cannot be created in Maximo. Please create it in SAP.' | Error message was immediately triggered after selecting 'Yes'.                |
-"""
+    except Exception as e:
+        print(f"An unexpected error occurred in process_chat_message: {e}")
+        return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
 
-def main():
-    """
-    Main function to parse arguments, generate the test case, and save it.
-    """
-    parser = argparse.ArgumentParser(
-        description="Generate an IBM Maximo test case in Markdown format using the Gemini API.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    parser.add_argument(
-        "scenario", # This is now optional
-        nargs='?',
-        default=None,
-        type=str,
-        help="The test scenario to be converted into a test case. Enclose in quotes."
-    )
-    parser.add_argument(
-        "-o", "--output",
-        type=str,
-        default="maximo_test_case.md",
-        help="The name of the output Markdown file. (default: maximo_test_case.md)"
-    )
-    parser.add_argument(
-        "--update-index",
-        action='store_true', # Makes it a flag, e.g., --update-kb
-        help="Update the vector index from the 'Learning_Maximo' folder. Run this after changing documents."
-    )
-    
-    args = parser.parse_args()
-
-    # Define project directories for better organization
-    project_dir = r'C:\Users\2166337\Test_Case'
-    learning_dir = os.path.join(project_dir, 'Learning_Maximo')
-    index_dir = os.path.join(project_dir, 'Maximo_VectorIndex')
-    output_dir = project_dir # Save output files in the main project folder
-
-    os.makedirs(learning_dir, exist_ok=True)
-    os.makedirs(index_dir, exist_ok=True)
-
-    # --- API Key ---
-    # WARNING: Storing API keys directly in code is not recommended for production
-    # or shared environments. For simplicity, it is defined here.
-    #
-    # Replace the placeholder text with your actual Google API key.
-    API_KEY = "AIzaSyBCIP9nSgxdJmMaBwITcbuFZ81dC9bzJLQ" # <-- PASTE YOUR KEY HERE
-    
-    # --- Mode 1: Update the Knowledge Base ---
-    if args.update_index:
-        print("--- Updating Vector Index ---")
-        update_vector_index(learning_dir, index_dir, API_KEY)
-        print("--- Vector Index update complete. ---")
-        sys.exit(0) # Exit successfully after updating
-
-    # --- Mode 2: Generate a Test Case (Normal Operation) ---
-    if not args.scenario:
-        parser.error("The 'scenario' argument is required when not using --update-kb.")
-
-
-    if "YOUR_API_KEY_HERE" in API_KEY or not API_KEY:
-        print("Error: Please open the script and replace 'YOUR_API_KEY_HERE' with your actual Google API key.", file=sys.stderr)
-        sys.exit(1)
-
-    # This main block is for command-line use only. The web app calls functions directly.
-    # For simplicity, we'll use a hardcoded example section for CLI mode.
-    example_section = _create_example_section(None)
-    api_keys = {"google": API_KEY} # CLI mode only supports Google for now
-    model_name = 'gemini-1.5-flash-latest'
-
-    custom_context = ""
-    custom_context = retrieve_relevant_context(args.scenario, index_dir, api_keys['google'])
-    if custom_context:
-        print("Successfully retrieved relevant context from the vector index.")
-    
-    test_case_markdown = generate_maximo_test_case(args.scenario, api_keys, custom_context, example_section, model_name)
-    
-    # Construct full paths for the output files
-    output_md_path = os.path.join(output_dir, args.output)
-    
+@app.route('/finalize', methods=['POST'])
+def finalize():
+    """Handles the final file generation and download."""
     try:
-        with open(output_md_path, 'w', encoding='utf-8') as f:
-            f.write(test_case_markdown)
-        print(f"\nSuccessfully generated and saved test case to '{os.path.abspath(output_md_path)}'")
-    except IOError as e:
-        print(f"Error writing to file '{output_md_path}': {e}", file=sys.stderr)
-        # We can still try to create the excel file, so we don't exit here.
+        # Get the definitive test case data from the session, not the client.
+        # This is more secure and reliable.
+        final_data = session.get('current_test_case')
+        
+        if not final_data:
+            return jsonify({'error': 'No active test case session found to finalize.'}), 400
 
-    # Save the extracted test steps to a separate Excel file.
-    base_name, _ = os.path.splitext(args.output)
-    excel_filename = f"{base_name}_steps.xlsx"
-    output_xlsx_path = os.path.join(output_dir, excel_filename)
-    save_steps_to_excel(test_case_markdown, output_xlsx_path)
+        # Reconstruct the full markdown on the server for reliability.
+        full_markdown = f"# Test Case: {final_data.get('title', '')}\n\n"
+        full_markdown += f"- **Test Case ID:** {final_data.get('test_case_id', '')}\n"
+        full_markdown += f"- **Title:** {final_data.get('title', '')}\n"
+        full_markdown += f"- **Objective:** {final_data.get('objective', '')}\n"
+        full_markdown += f"- **Scenario:** {final_data.get('scenario', '')}\n"
+        full_markdown += f"- **Prerequisites:** {final_data.get('prerequisites', '')}\n\n"
+        full_markdown += f"- **Test Steps:**\n"
+        full_markdown += f"| Actions | Expected Result | Actual Result |\n"
+        full_markdown += f"|---|---|---|\n"
+        if final_data.get('test_steps'):
+            for step in final_data['test_steps']:
+                full_markdown += f"| {step.get('Actions', '')} | {step.get('Expected Result', '')} | {step.get('Actual Result', '')} |\n"
 
-if __name__ == "__main__":
-    main()
+
+        # Create the output files in memory
+        md_filename = "final_test_case.md"
+        xlsx_filename = "final_test_case_steps.xlsx"
+        
+        # Use BytesIO to keep files in memory instead of writing to disk on the server
+        md_io = io.BytesIO(full_markdown.encode('utf-8'))
+        md_io.seek(0)
+
+        # Create a temporary path for the excel file to be saved by the generator function
+        temp_xlsx_path = os.path.join(output_dir, xlsx_filename)
+        generator.save_steps_to_excel(full_markdown, temp_xlsx_path)
+
+        # Create a zip file in memory
+        zip_io = io.BytesIO()
+        with zipfile.ZipFile(zip_io, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(md_filename, md_io.read())
+            zf.write(temp_xlsx_path, arcname=xlsx_filename)
+        zip_io.seek(0)
+
+        # Clean up the temp excel file
+        os.remove(temp_xlsx_path)
+
+        return send_file(
+            zip_io,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name='Maximo_TestCase_Package.zip'
+        )
+
+    except Exception as e:
+        return jsonify({'error': f'An unexpected error occurred during finalization: {str(e)}'}), 500
+
+
+@app.route('/update_kb', methods=['POST'])
+def update_kb():
+    """Handles uploading a new document to the knowledge base and updating the index."""
+    try:
+        if 'kb_file' not in request.files or request.files['kb_file'].filename == '':
+            flash('No file selected for knowledge base update.')
+            return jsonify({'error': 'No file selected.'}), 400
+
+        kb_file = request.files['kb_file']
+        filename = secure_filename(kb_file.filename)
+        
+        # Save the new document to the Learning_Maximo folder
+        kb_file.save(os.path.join(learning_dir, filename))
+        
+        # Immediately trigger the index update
+        # This can take time, so for a real production app, you'd use a background task queue.
+        # For this script, we'll run it directly and the user will wait.
+        generator.update_vector_index(learning_dir, index_dir, API_KEYS['google'])
+
+        return jsonify({'message': f"Knowledge base successfully updated with '{filename}'. The index has been rebuilt."})
+
+    except Exception as e:
+        return jsonify({'error': f'An error occurred while updating the knowledge base: {str(e)}'}), 500
+
+
+# --- Maximo Agent Routes ---
+
+def get_maximo_client():
+    """Helper function to instantiate and return a Maximo client or raise an error."""
+    # The configuration is now handled globally at the top of the file.
+    if not MAXIMO_HOST or not MAXIMO_API_KEY:
+        # For a web app, it's better to raise an exception that can be caught
+        # and shown to the user, rather than just printing to the console.
+        raise ValueError("Server configuration error: MAXIMO_HOST and MAXIMO_API_KEY must be set.")
+    return MaximoAPIClient(host=MAXIMO_HOST, api_key=MAXIMO_API_KEY)
+
+@app.route('/maximo_chat_agent')
+def maximo_chat_agent():
+    """Renders the new conversational Maximo agent page."""
+    return render_template('maximo_chat_agent.html')
+
+@app.route('/maximo/process_chat', methods=['POST'])
+def maximo_process_chat():
+    """
+    Processes a natural language query for the Maximo agent,
+    determines the correct API call, executes it, and returns the result.
+    """
+    try:
+        data = request.get_json()
+        user_prompt = data.get('prompt')
+
+        if not user_prompt:
+            return jsonify({"status": "error", "message": "Prompt cannot be empty."}), 400
+
+        tool_call_result = maximo_nl_agent.get_maximo_tool_call(user_prompt, API_KEYS['google'])
+
+        if tool_call_result.get('status') != 'success':
+            return jsonify(tool_call_result)
+
+        tool_name = tool_call_result.get('tool_name')
+        tool_args = tool_call_result.get('tool_args', {})
+        
+        client = get_maximo_client()
+        
+        # Dynamically call the method on the client instance
+        if hasattr(client, tool_name):
+            method_to_call = getattr(client, tool_name)
+            result = method_to_call(**tool_args)
+        else:
+            return jsonify({"status": "error", "message": f"Unknown tool identified: {tool_name}"}), 400
+
+        if result is not None: # This means no network/API error occurred
+            if result: # Asset(s) were found and result is a non-empty list
+                return jsonify({"status": "success", "data": result, "tool_called": tool_name})
+            else: # No assets were found (result is an empty list)
+                assetnum = tool_args.get('assetnum', '')
+                siteid = tool_args.get('siteid', 'any')
+                return jsonify({"status": "not_found", "message": f"No assets found matching asset number(s) '{assetnum}' at site '{siteid}'."})
+        else: # An error occurred (result is None)
+            return jsonify({"status": "error", "message": f"The action '{tool_name}' failed. Check server logs for connection or permission issues."}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+if __name__ == '__main__':
+    print("Flask server starting...")
+    print(f"Open your browser and go to http://127.0.0.1:5000")
+    app.run(debug=True, host='0.0.0.0', port=5000)
