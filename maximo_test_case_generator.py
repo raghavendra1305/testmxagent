@@ -526,17 +526,16 @@ def main():
     os.makedirs(learning_dir, exist_ok=True)
     os.makedirs(index_dir, exist_ok=True)
 
-    # --- API Key ---
-    # WARNING: Storing API keys directly in code is not recommended for production
-    # or shared environments. For simplicity, it is defined here.
-    #
-    # Replace the placeholder text with your actual Google API key.
-    API_KEY = "AIzaSyBCIP9nSgxdJmMaBwITcbuFZ81dC9bzJLQ" # <-- PASTE YOUR KEY HERE
-    
+    # For command-line use, we'll get the key from the environment, just like the web app.
+    # This makes behavior consistent.
+    cli_api_key = os.environ.get("GOOGLE_API_KEY", "AIzaSyBCIP9nSgxdJmMaBwITcbuFZ81dC9bzJLQ")
+    if "AIzaSyBCIP9nSgxdJmMaBwITcbuFZ81dC9bzJLQ" in cli_api_key:
+        print("WARNING: Using hardcoded fallback API key for command-line execution.")
+
     # --- Mode 1: Update the Knowledge Base ---
     if args.update_index:
         print("--- Updating Vector Index ---")
-        update_vector_index(learning_dir, index_dir, API_KEY)
+        update_vector_index(learning_dir, index_dir, cli_api_key)
         print("--- Vector Index update complete. ---")
         sys.exit(0) # Exit successfully after updating
 
@@ -544,15 +543,10 @@ def main():
     if not args.scenario:
         parser.error("The 'scenario' argument is required when not using --update-kb.")
 
-
-    if "YOUR_API_KEY_HERE" in API_KEY or not API_KEY:
-        print("Error: Please open the script and replace 'YOUR_API_KEY_HERE' with your actual Google API key.", file=sys.stderr)
-        sys.exit(1)
-
     # This main block is for command-line use only. The web app calls functions directly.
     # For simplicity, we'll use a hardcoded example section for CLI mode.
     example_section = _create_example_section(None)
-    api_keys = {"google": API_KEY} # CLI mode only supports Google for now
+    api_keys = {"google": cli_api_key} # CLI mode only supports Google for now
     model_name = 'gemini-1.5-flash-latest'
 
     custom_context = ""
