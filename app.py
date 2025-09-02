@@ -268,10 +268,15 @@ def maximo_process_chat():
         else:
             return jsonify({"status": "error", "message": f"Unknown tool identified: {tool_name}"}), 400
 
-        if result:
-            return jsonify({"status": "success", "data": result, "tool_called": tool_name})
-        else:
-            return jsonify({"status": "error", "message": f"The action '{tool_name}' failed or returned no data. Check server logs."}), 500
+        if result is not None: # This means no network/API error occurred
+            if result: # Asset(s) were found and result is a non-empty list
+                return jsonify({"status": "success", "data": result, "tool_called": tool_name})
+            else: # No assets were found (result is an empty list)
+                assetnum = tool_args.get('assetnum', '')
+                siteid = tool_args.get('siteid', 'any')
+                return jsonify({"status": "not_found", "message": f"No assets found matching asset number(s) '{assetnum}' at site '{siteid}'."})
+        else: # An error occurred (result is None)
+            return jsonify({"status": "error", "message": f"The action '{tool_name}' failed. Check server logs for connection or permission issues."}), 500
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
