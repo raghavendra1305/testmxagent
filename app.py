@@ -33,7 +33,9 @@ MAXIMO_API_KEY = os.environ.get("MAXIMO_API_KEY")
 
 # Check for missing keys and print a warning.
 if not GOOGLE_API_KEY:
-    print("WARNING: GOOGLE_API_KEY environment variable is not set.")
+    # For development, you can provide a fallback key here if the environment variable is not set.
+    print("WARNING: GOOGLE_API_KEY environment variable not found. Using hardcoded key for development.")
+    GOOGLE_API_KEY = "AIzaSyBCIP9nSgxdJmMaBwITcbuFZ81dC9bzJLQ"
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY environment variable is not set.")
 
