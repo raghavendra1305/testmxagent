@@ -1,0 +1,17 @@
+C:\Users\2166337\Test_Case\
+|
+|-- app.py
+|-- maximo_api_agent.py
+|-- maximo_natural_language_agent.py
+|-- maximo_test_case_generator.py
+|-- requirements.txt  <-- SAVE IT HERE
+|
+|-- templates\
+|   |-- home.html
+|   |-- maximo_chat_agent.html
+|   |-- ...
+|
+|-- Learning_Maximo\
+|-- Maximo_VectorIndex\
+|-- output\
+|-- sample_test\
