@@ -72,8 +72,7 @@ def generate_maximo_test_case(scenario: str, api_keys: dict, custom_context: str
 
         if "gemini" in model_name:
             # For Gemini, we combine the system and user prompts into a single prompt.
-            full_prompt = get_system_prompt() + "\n\n" + build_user_prompt(scenario, custom_context, example_section)
-            genai.configure(api_key=api_keys.get('google'))
+            full_prompt = get_system_prompt() + "\n\n" + build_user_prompt(scenario, custom_context, example_section)            
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(full_prompt)
             return response.text.strip().strip('```markdown').strip('```').strip()
@@ -181,7 +180,6 @@ You are an expert test case editor. Your task is to modify the provided Markdown
     try:
         print(f"--> Modifying test steps with model: '{model_name}'")
         if "gemini" in model_name:
-            genai.configure(api_key=api_keys.get('google'))
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(prompt)
             return response.text.strip().strip('```markdown').strip('```').strip()
@@ -227,7 +225,6 @@ User's Request: "{user_input}"
 """
     try:
         print(f"--> Classifying intent for input: '{user_input}'")
-        genai.configure(api_key=api_keys.get('google'))
         model = genai.GenerativeModel(model_name)
         response = model.generate_content(prompt)
         # Clean up the response to get a single word.
@@ -368,7 +365,6 @@ def update_vector_index(source_dir: str, index_dir: str, api_key: str):
     
     # Create embeddings for all chunks
     try:
-        genai.configure(api_key=api_key)
         chunk_texts = [chunk['text'] for chunk in all_chunks]
         # The 'models/embedding-001' is a powerful model for this task.
         result = genai.embed_content(model='models/embedding-001',
@@ -406,7 +402,6 @@ def retrieve_relevant_context(scenario: str, index_dir: str, api_key: str, top_k
         doc_embeddings = np.load(embeddings_path)
 
         # Create an embedding for the user's scenario (the query)
-        genai.configure(api_key=api_key)
         query_embedding = genai.embed_content(model='models/embedding-001',
                                               content=scenario,
                                               task_type="RETRIEVAL_QUERY")['embedding']
@@ -526,11 +521,18 @@ def main():
     os.makedirs(learning_dir, exist_ok=True)
     os.makedirs(index_dir, exist_ok=True)
 
-    # For command-line use, we'll get the key from the environment, just like the web app.
-    # This makes behavior consistent.
+    # --- API Key for Command-Line Mode ---
     cli_api_key = os.environ.get("GOOGLE_API_KEY", "AIzaSyBCIP9nSgxdJmMaBwITcbuFZ81dC9bzJLQ")
     if "AIzaSyBCIP9nSgxdJmMaBwITcbuFZ81dC9bzJLQ" in cli_api_key:
         print("WARNING: Using hardcoded fallback API key for command-line execution.")
+
+    # Configure genai once for command-line use
+    try:
+        genai.configure(api_key=cli_api_key)
+        print("✅ Google Generative AI configured for CLI.")
+    except Exception as e:
+        print(f"❌ ERROR: Failed to configure Google Generative AI for CLI: {e}")
+        sys.exit(1)
 
     # --- Mode 1: Update the Knowledge Base ---
     if args.update_index:
