@@ -7,17 +7,21 @@ import json
 MAXIMO_TOOLS = [
     {
         "name": "get_asset",
-        "description": "Retrieves details for a specific asset from Maximo, such as its description and status.",
+        "description": "Retrieves details for one or more assets from Maximo. You can specify which fields to return.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "assetnum": {
                     "type": "STRING",
-                    "description": "The unique identifier for the asset, e.g., 'PUMP-123'."
+                    "description": "The unique identifier for the asset. For multiple assets, provide a comma-separated list, e.g., '11430,11431'."
                 },
                 "siteid": {
                     "type": "STRING",
                     "description": "The site identifier for the asset, e.g., 'BEDFORD'."
+                },
+                "fields_to_select": {
+                    "type": "STRING",
+                    "description": "A comma-separated list of fields to retrieve, e.g., 'description,status,serialnum,installdate'."
                 }
             },
             "required": ["assetnum"]
@@ -61,7 +65,12 @@ def get_maximo_tool_call(user_prompt: str, api_key: str):
     """
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name='gemini-1.5-flash-latest', tools=MAXIMO_TOOLS)
+        # Adding a system instruction gives the model a clearer role and improves reliability.
+        model = genai.GenerativeModel(
+            model_name='gemini-1.5-flash-latest',
+            tools=MAXIMO_TOOLS,
+            system_instruction="You are a helpful assistant that translates natural language requests into structured API calls for an IBM Maximo system. You must only use the tools provided to you."
+        )
         
         print(f"--> Sending prompt to Gemini for function calling: '{user_prompt}'")
         response = model.generate_content(user_prompt)
