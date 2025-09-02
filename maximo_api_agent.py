@@ -60,21 +60,38 @@ class MaximoAPIClient:
             print(f"❌ CRITICAL: A network error occurred during connection test.\n   Error: {e}")
             return None
 
-    def get_asset(self, assetnum, siteid=None):
+    def get_asset(self, assetnum: str, siteid: str = None, fields_to_select: str = None) -> list | None:
         """
-        Retrieves details for a specific asset.
+        Retrieves details for one or more assets.
         """
         url = f"{self.host}/maximo/api/os/mxasset"
 
-        where_clause = f'assetnum="{assetnum}"'
+        # Handle single or multiple asset numbers by building the correct WHERE clause.
+        if "," in assetnum:
+            # Create a list of quoted asset numbers for the IN clause
+            asset_list = [f'"{a.strip()}"' for a in assetnum.split(',')]
+            where_clause = f'assetnum in [{",".join(asset_list)}]'
+        else:
+            where_clause = f'assetnum="{assetnum.strip()}"'
+
         if siteid:
             where_clause += f' and siteid="{siteid}"'
 
+        # Default fields if none are provided, otherwise use the requested fields.
+        # This makes the function backward-compatible.
+        select_fields = "assetnum,description,status"
+        if fields_to_select:
+            # Ensure assetnum is always included for data consistency
+            if "assetnum" not in fields_to_select.lower().split(','):
+                select_fields = "assetnum," + fields_to_select
+            else:
+                select_fields = fields_to_select
+
         params = {
             "oslc.where": where_clause,
-            "oslc.select": "assetnum,description,status", # only these fields
+            "oslc.select": select_fields, # Use the dynamic or default fields
             "lean": 1,
-            "oslc.pageSize": 1,
+            # "oslc.pageSize": 1, # Removed to allow multiple records to be returned
             "_format": "json"
         }
 
@@ -83,20 +100,22 @@ class MaximoAPIClient:
         try:
             response = requests.get(url, params=params, headers=self.headers, verify=False, timeout=15)
 
-            if response.status_code == 200:
+            if response.ok:
                 data = response.json()
-                if "member" in data and data["member"]:
-                    asset = data["member"][0]
-
-                    # Extract only clean fields
-                    clean_asset = {
-                        "assetnum": asset.get("assetnum"),
-                        "description": asset.get("description"),
-                        "status": asset.get("status")
-                    }
-                    return clean_asset
+                if "member" in data and data.get("member"):
+                    assets = data["member"]
+                    
+                    requested_fields = select_fields.split(',')
+                    
+                    # Process all returned assets into a list of clean dictionaries
+                    clean_assets = []
+                    for asset in assets:
+                        clean_asset = {field: asset.get(field) for field in requested_fields if field in asset}
+                        clean_assets.append(clean_asset)
+                    return clean_assets
                 else:
-                    return None
+                    # No assets found, return an empty list
+                    return []
             else:
                 print(f"❌ API Error while fetching asset: {response.status_code} - {response.text}")
                 return None
